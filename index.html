@@ -65,7 +65,7 @@
 const { useState, useEffect, useMemo, useRef } = React;
 
 const STORAGE_KEY = "habit-tracker-v1";
-const APP_VERSION = "2026-07-05.6";
+const APP_VERSION = "2026-07-05.7";
 
 /* ---------- GLACIER · Apple-dark on Jakub's palette ---------- */
 const P = {
@@ -392,6 +392,8 @@ const App = () => {
   const [copied, setCopied] = useState(false);
   const [upState, setUpState] = useState("idle");
   const [upLatest, setUpLatest] = useState("");
+  const [backupMsg, setBackupMsg] = useState("");
+  const fileRef = useRef(null);
 
   const persist = (next) => { setData(next); setSaveErr(!saveData(next)); };
   const day = data.days[sel] || emptyDay(sel);
@@ -448,6 +450,43 @@ const App = () => {
     }
     lines.push("", `exported ${prettyDate(todayISO())} · v${APP_VERSION}`);
     try { await navigator.clipboard.writeText(lines.join("\n")); setCopied(true); setTimeout(() => setCopied(false), 1700); } catch (e) {}
+  };
+
+  /* JSON backup — download a restorable file */
+  const exportJSON = () => {
+    const payload = JSON.stringify({ app: "inputs", version: APP_VERSION, exported: new Date().toISOString(), data }, null, 2);
+    const blob = new Blob([payload], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `inputs-backup-${todayISO()}.json`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    setBackupMsg("✓ Backup saved"); setTimeout(() => setBackupMsg(""), 2200);
+  };
+
+  /* restore from a backup file — merges by day, keeping the richer copy */
+  const importJSON = (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(reader.result);
+        const incoming = parsed && parsed.data && parsed.data.days ? parsed.data.days
+                       : parsed && parsed.days ? parsed.days : null;
+        if (!incoming) { setBackupMsg("✕ Not a valid backup"); setTimeout(() => setBackupMsg(""), 2600); return; }
+        const merged = { ...incoming, ...data.days };
+        // for overlapping days, prefer whichever has more logged (avoid clobbering with an emptier copy)
+        const score = (d) => (d.bedtime?1:0)+(d.wake?1:0)+(d.phoneOff!==null?1:0)+(d.reels!==null?1:0)+(d.briefing!==null?1:0)+((d.moods&&d.moods.length)||0)+(d.note?1:0);
+        Object.keys(incoming).forEach((k) => { if (data.days[k]) merged[k] = score(incoming[k]) > score(data.days[k]) ? incoming[k] : data.days[k]; });
+        persist({ days: merged });
+        const n = Object.keys(incoming).filter((k) => dayHasData(incoming[k])).length;
+        setBackupMsg(`✓ Restored ${n} ${n === 1 ? "day" : "days"}`); setTimeout(() => setBackupMsg(""), 2800);
+      } catch (err) { setBackupMsg("✕ Couldn't read file"); setTimeout(() => setBackupMsg(""), 2600); }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
   };
 
   const timeInput = (val, on) => (
@@ -658,6 +697,30 @@ const App = () => {
             </Section>
           </div>
         )}
+
+        {/* backup / restore */}
+        <div className="rise" style={{ "--i": 6, ...card(), borderRadius: 18, padding: "15px 16px", marginTop: 16 }}>
+          <Label icon="copy">Backup</Label>
+          <div style={{ fontSize: 12, color: P.dim, fontFamily: SANS, lineHeight: 1.45, marginBottom: 13 }}>
+            Save a file with all your days. Keep it safe — restore it any time (after an update, a new phone, or if the app ever resets).
+          </div>
+          <div style={{ display: "flex", gap: 9 }}>
+            <button onClick={exportJSON} className="press"
+              style={{ flex: 1, padding: "12px 0", borderRadius: 13, fontSize: 13.5, fontWeight: 700, fontFamily: SANS, border: "none",
+                background: GRAD_PRIMARY, color: "#fff", boxShadow: "0 4px 14px rgba(0,121,152,0.35)" }}>
+              ↓ Back up
+            </button>
+            <button onClick={() => fileRef.current && fileRef.current.click()} className="press"
+              style={{ flex: 1, padding: "12px 0", borderRadius: 13, fontSize: 13.5, fontWeight: 700, fontFamily: SANS, border: "none",
+                background: "rgba(255,255,255,0.05)", color: P.dim }}>
+              ↑ Restore
+            </button>
+            <input ref={fileRef} type="file" accept="application/json,.json" onChange={importJSON} style={{ display: "none" }} />
+          </div>
+          {backupMsg && (
+            <div className="pop" style={{ textAlign: "center", marginTop: 11, fontSize: 12.5, fontWeight: 700, fontFamily: SANS, color: backupMsg[0] === "✓" ? P.ice : P.bad }}>{backupMsg}</div>
+          )}
+        </div>
 
         {/* version */}
         <div style={{ textAlign: "center", marginTop: 20 }}>
