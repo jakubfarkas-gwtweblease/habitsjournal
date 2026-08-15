@@ -14,18 +14,22 @@
 <style>
   * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
   html, body { margin:0; padding:0; min-height:100%; width:100%; max-width:100%; overflow-x:hidden; }
-  /* no background on html → body's background propagates to the canvas and fills
-     the whole screen, safe areas and overscroll included. No band, ever. */
-  body {
-    background:
+  /* The gradient lives on HTML, not body. Two reasons:
+     1. html paints the canvas → covers every edge, top and bottom, plus overscroll.
+     2. Safari samples the ROOT element's colour for the status-bar area. With no
+        background on html it sampled white — that was the white strip up top. */
+  html {
+    background-color: #5B34D6;              /* solid fallback = what the status bar samples */
+    background-image:
       radial-gradient(120% 42% at 100% 0%, rgba(255,255,255,0.16), transparent 62%),
       radial-gradient(100% 34% at 0% 46%, rgba(255,210,150,0.16), transparent 62%),
       radial-gradient(90% 30% at 100% 88%, rgba(0,229,196,0.13), transparent 62%),
       linear-gradient(178deg, #5B34D6 0%, #6C3FE0 12%, #8B45CE 30%, #C8541F 50%, #F2610C 63%, #F97316 73%, #F79A6B 85%, #F5A9A0 94%, #F2988C 100%);
     background-attachment: fixed;
     background-repeat: no-repeat;
-    min-height: 100vh;
+    background-size: cover;
   }
+  body { background: transparent; min-height: 100vh; }
   #root { min-height:100%; }
   input, textarea, button { font-family:inherit; }
   button { -webkit-appearance:none; appearance:none; background:transparent; border:none; color:inherit; cursor:pointer; }
@@ -101,7 +105,7 @@
 const { useState, useEffect, useMemo, useRef } = React;
 
 const STORAGE_KEY = "habit-tracker-v1";
-const APP_VERSION = "2026-08-15.6";
+const APP_VERSION = "2026-08-15.8";
 
 /* ---------- SUNSET · violet → orange → blush, mint accent ---------- */
 const P = {
@@ -166,6 +170,20 @@ const fmtHours = (h) => h === null ? "—" : `${Math.floor(h)}h${pad2(Math.round
 const dayName = (iso) => new Date(iso+"T00:00:00").toLocaleDateString("en-GB", { weekday:"short" });
 const dayNameLong = (iso) => new Date(iso+"T00:00:00").toLocaleDateString("en-GB", { weekday:"long" });
 const prettyDate = (iso) => { const [y,m,d] = iso.split("-"); return `${parseInt(d)}.${parseInt(m)}.${y}`; };
+const shortD = (iso) => { const [, m, d] = iso.split("-"); return `${parseInt(d)}.${parseInt(m)}.`; };
+/* A day record holds the night that ENDS on that morning.
+   Bedtime before midnight belongs to the previous calendar day. */
+const bedDateOf = (iso, bedtime) => {
+  if (!bedtime) return shiftISO(iso, -1);
+  const h = parseInt(bedtime.split(":")[0], 10);
+  return isNaN(h) ? shiftISO(iso, -1) : (h >= 12 ? shiftISO(iso, -1) : iso);
+};
+/* the night always straddles midnight, so the span is always prev-day → day.
+   bedDateOf() still gives the true calendar date the bedtime was clocked on. */
+const nightLabel = (iso) => `${shortD(shiftISO(iso, -1))} → ${shortD(iso)}`;
+/* Going to bed now: which record does tonight's sleep land in?
+   Evening (19:00+) → tomorrow's record. After midnight (<5:00) → today's. */
+const bedTargetISO = () => { const h = new Date().getHours(); return h >= 19 ? shiftISO(todayISO(), 1) : todayISO(); };
 const shiftISO = (iso, delta) => { const d = new Date(iso+"T00:00:00"); d.setDate(d.getDate()+delta); return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`; };
 
 const avgMood = (day) => {
@@ -197,8 +215,12 @@ const saveData = (d) => { try { localStorage.setItem(STORAGE_KEY, JSON.stringify
 
 /* ---------- background ---------- */
 const Background = () => (
-  <div style={{ position: "fixed", inset: 0, zIndex: -1, pointerEvents: "none", opacity: 0.10,
-    backgroundImage: "radial-gradient(rgba(255,255,255,0.9) 1px, transparent 1px)", backgroundSize: "26px 26px" }} />
+  <React.Fragment>
+    <div style={{ position: "fixed", inset: 0, zIndex: -2, pointerEvents: "none",
+      background: "linear-gradient(178deg, #5B34D6 0%, #6C3FE0 12%, #8B45CE 30%, #C8541F 50%, #F2610C 63%, #F97316 73%, #F79A6B 85%, #F5A9A0 94%, #F2988C 100%)" }} />
+    <div style={{ position: "fixed", inset: 0, zIndex: -1, pointerEvents: "none", opacity: 0.10,
+      backgroundImage: "radial-gradient(rgba(255,255,255,0.9) 1px, transparent 1px)", backgroundSize: "26px 26px" }} />
+  </React.Fragment>
 );
 /* ---------- inline icons (stroke, currentColor) ---------- */
 const Icon = ({ name, size = 18, stroke = 1.8 }) => {
@@ -640,6 +662,7 @@ const App = () => {
   const persist = (next) => { setData(next); setSaveErr(!saveData(next)); };
   const day = data.days[sel] || emptyDay(sel);
   const updDay = (patch) => persist({ ...data, days: { ...data.days, [sel]: { ...day, ...patch } } });
+  const updDate = (iso, patch) => persist({ ...data, days: { ...data.days, [iso]: { ...(data.days[iso] || emptyDay(iso)), ...patch } } });
 
   const last7 = useMemo(() => {
     const arr = [];
@@ -777,16 +800,22 @@ const App = () => {
 
         {tab === "today" ? (
           <div key="today" className="fade">
-            {/* time-aware prompt · evening asks bedtime, early morning asks wake */}
+            {/* time-aware prompt · writes into the night it actually belongs to */}
             {(() => {
               if (!isToday || promptOff) return null;
-              const hr = new Date().getHours();
+              const now = new Date(), hr = now.getHours(), mn = now.getMinutes();
               const evening = hr >= 19 || hr < 5;
-              const morning = hr >= 5 && hr < 8;
-              const ask = evening && !day.bedtime ? "bed" : morning && !day.wake ? "wake" : null;
+              const morning = (hr === 4 && mn >= 59) || (hr >= 5 && hr < 8);
+              const tISO = bedTargetISO();
+              const tDay = data.days[tISO] || emptyDay(tISO);
+              const ask = evening && !tDay.bedtime ? "bed" : morning && !day.wake ? "wake" : null;
               if (!ask) return null;
               const isBed = ask === "bed";
-              const c = isBed ? HUE.sleep.c : "#F2610C";
+              const nightTxt = isBed
+                ? `Noc ${shortD(todayISO())} → ${shortD(tISO)}`
+                : `Noc ${shortD(bedDateOf(sel, day.bedtime))} → ${shortD(sel)}`;
+              const val = isBed ? tDay.bedtime : day.wake;
+              const write = (v) => isBed ? updDate(tISO, { bedtime: v }) : updDay({ wake: v });
               return (
                 <div className="pop" style={{ position: "relative", overflow: "hidden", borderRadius: 24, padding: "18px", marginBottom: 14,
                   background: isBed ? "linear-gradient(125deg, #3A1C7A 0%, #6C3FE0 100%)" : "linear-gradient(125deg, #C8541F 0%, #F9A03F 100%)",
@@ -794,27 +823,32 @@ const App = () => {
                   <div style={{ position: "absolute", inset: 0, pointerEvents: "none", background: "radial-gradient(110% 80% at 100% 0%, rgba(255,255,255,0.2), transparent 62%)" }} />
                   <button onClick={() => setPromptOff(true)} className="press" aria-label="Dismiss"
                     style={{ position: "absolute", top: 12, right: 12, width: 28, height: 28, borderRadius: "50%", background: "rgba(255,255,255,0.18)", color: "#fff", fontSize: 15, lineHeight: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>×</button>
-                  <div style={{ position: "relative", display: "flex", alignItems: "center", gap: 11, marginBottom: 14 }}>
+                  <div style={{ position: "relative", display: "flex", alignItems: "center", gap: 11, marginBottom: 13 }}>
                     <span style={{ width: 38, height: 38, borderRadius: 13, background: "rgba(255,255,255,0.2)", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
                       <Icon name={isBed ? "moon" : "sunrise"} size={20} stroke={2} />
                     </span>
-                    <div>
+                    <div style={{ minWidth: 0 }}>
                       <div style={{ fontSize: 16.5, fontWeight: 800, color: "#fff", fontFamily: SANS, lineHeight: 1.2 }}>
-                        {isBed ? "When are you going to sleep?" : "When did you wake up?"}
+                        {isBed ? "Kedy ideš spať?" : "Kedy si sa zobudil?"}
                       </div>
-                      <div style={{ fontSize: 11.5, color: "rgba(255,255,255,0.72)", fontFamily: SANS, marginTop: 2 }}>
-                        {isBed ? "Set it now, log the wake time in the morning." : "Good morning — close off last night."}
+                      <div style={{ display: "inline-flex", alignItems: "center", gap: 6, marginTop: 5, padding: "3px 9px", borderRadius: 999,
+                        background: "rgba(255,255,255,0.18)", fontSize: 11.5, fontWeight: 700, color: "#fff", fontFamily: MONO }}>
+                        <Icon name="moon" size={11} /> {nightTxt}
                       </div>
                     </div>
                   </div>
                   <div style={{ position: "relative", display: "flex", gap: 9 }}>
-                    <input type="time" value={isBed ? day.bedtime : day.wake}
-                      onChange={(e) => updDay(isBed ? { bedtime: e.target.value } : { wake: e.target.value })}
+                    <input type="time" value={val} onChange={(e) => write(e.target.value)}
                       style={{ flex: 1, background: "rgba(255,255,255,0.94)", border: "none", borderRadius: 14, padding: "13px 15px", color: P.text, fontSize: 17, fontFamily: MONO, outline: "none" }} />
-                    <button onClick={() => updDay(isBed ? { bedtime: nowHM() } : { wake: nowHM() })} className="press"
+                    <button onClick={() => write(nowHM())} className="press"
                       style={{ padding: "0 18px", borderRadius: 14, background: P.mint, color: INK_ON_MINT, fontSize: 13.5, fontWeight: 800, fontFamily: SANS, whiteSpace: "nowrap", boxShadow: "0 4px 14px rgba(0,229,196,0.45)" }}>
-                      Now
+                      Teraz
                     </button>
+                  </div>
+                  <div style={{ position: "relative", fontSize: 11.5, color: "rgba(255,255,255,0.72)", fontFamily: SANS, marginTop: 10 }}>
+                    {isBed
+                      ? `Uloží sa do ${tISO === todayISO() ? "dnešného" : "zajtrajšieho"} dňa (${shortD(tISO)}) — tam, kde sa táto noc skončí.`
+                      : "Uzavrie noc, ktorá sa práve skončila."}
                   </div>
                 </div>
               );
@@ -827,13 +861,21 @@ const App = () => {
                   {fmtHours(sleepH)}{sleepH < SLEEP_MIN ? " ⚠" : ""}
                 </span>
               )} icon="moon" color={HUE.sleep.c}>Sleep</Label>
+              <div style={{ display: "inline-flex", alignItems: "center", gap: 6, marginBottom: 12, padding: "4px 10px", borderRadius: 999,
+                background: HUE.sleep.tint, color: HUE.sleep.c, fontSize: 11.5, fontWeight: 800, fontFamily: MONO }}>
+                <Icon name="moon" size={12} /> Noc {nightLabel(sel)}
+              </div>
               <div style={{ display: "flex", gap: 10 }}>
                 <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: 11, color: P.faint, marginBottom: 5, fontFamily: SANS }}>Bedtime</div>
+                  <div style={{ fontSize: 11, color: P.slate, marginBottom: 5, fontFamily: SANS, fontWeight: 600 }}>
+                    Ľahol · <span style={{ fontFamily: MONO, color: P.dim }}>{shortD(bedDateOf(sel, day.bedtime))}</span>
+                  </div>
                   {timeInput(day.bedtime, (v) => updDay({ bedtime: v }))}
                 </div>
                 <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: 11, color: P.faint, marginBottom: 5, fontFamily: SANS }}>Wake</div>
+                  <div style={{ fontSize: 11, color: P.slate, marginBottom: 5, fontFamily: SANS, fontWeight: 600 }}>
+                    Vstal · <span style={{ fontFamily: MONO, color: P.dim }}>{shortD(sel)}</span>
+                  </div>
                   {timeInput(day.wake, (v) => updDay({ wake: v }))}
                 </div>
               </div>
